@@ -16,7 +16,13 @@ find_library(
         log
 )
 
+find_library(
+        aaudio-lib
+        aaudio
+)
+
 target_link_libraries(
         native_audio
         ${log-lib}
+        ${aaudio-lib}
 )

@@ -16,8 +16,17 @@ class MainActivity : FlutterActivity() {
 
     private external fun nativeGetEngineStatus(): String
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+    private external fun nativePlayTestTone(): String
+
+    private external fun nativeStopAudio(): String
+
+
+    override fun configureFlutterEngine(
+        flutterEngine: FlutterEngine
+    ) {
+
         super.configureFlutterEngine(flutterEngine)
+
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -27,10 +36,16 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
 
                 "getEngineStatus" -> {
+
                     try {
-                        val status = nativeGetEngineStatus()
+
+                        val status =
+                            nativeGetEngineStatus()
+
                         result.success(status)
+
                     } catch (e: Exception) {
+
                         result.error(
                             "NATIVE_ERROR",
                             e.message,
@@ -38,6 +53,47 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 }
+
+
+                "playTestTone" -> {
+
+                    try {
+
+                        val status =
+                            nativePlayTestTone()
+
+                        result.success(status)
+
+                    } catch (e: Exception) {
+
+                        result.error(
+                            "AUDIO_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+
+                "stopAudio" -> {
+
+                    try {
+
+                        val status =
+                            nativeStopAudio()
+
+                        result.success(status)
+
+                    } catch (e: Exception) {
+
+                        result.error(
+                            "AUDIO_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
 
                 else -> {
                     result.notImplemented()
