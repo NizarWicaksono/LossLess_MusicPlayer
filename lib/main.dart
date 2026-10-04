@@ -1,19 +1,23 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 void main() {
   runApp(const HiResPlayerApp());
 }
 
 
+// ============================================================
+// APP
+// ============================================================
+
 class HiResPlayerApp extends StatelessWidget {
-
   const HiResPlayerApp({super.key});
-
 
   @override
   Widget build(BuildContext context) {
-
     return MaterialApp(
       debugShowCheckedModeBanner: false,
 
@@ -30,30 +34,57 @@ class HiResPlayerApp extends StatelessWidget {
 }
 
 
-class HomePage extends StatefulWidget {
+// ============================================================
+// HOME PAGE
+// ============================================================
 
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
-
   @override
-  State<HomePage> createState() =>
-      _HomePageState();
+  State<HomePage> createState() {
+    return _HomePageState();
+  }
 }
 
 
+// ============================================================
+// HOME PAGE STATE
+// ============================================================
+
 class _HomePageState extends State<HomePage> {
+
+  // ----------------------------------------------------------
+  // MethodChannel
+  // ----------------------------------------------------------
 
   static const MethodChannel _channel =
       MethodChannel('native_audio');
 
 
+  // ----------------------------------------------------------
+  // Status
+  // ----------------------------------------------------------
+
   String _status =
       'Audio Engine belum dites';
 
 
+  bool _isPlaying = false;
+
+
+  // ==========================================================
+  // TEST NATIVE ENGINE
+  // ==========================================================
+
   Future<void> _testEngine() async {
 
     try {
+
+      setState(() {
+        _status = 'Menghubungkan ke Native Audio Engine...';
+      });
+
 
       final result =
           await _channel.invokeMethod<String>(
@@ -73,27 +104,131 @@ class _HomePageState extends State<HomePage> {
       setState(() {
 
         _status =
-            'Error: ${e.message}';
+            'Engine Error: ${e.message}';
+
+      });
+
+    } catch (e) {
+
+      setState(() {
+
+        _status =
+            'Error: $e';
 
       });
     }
   }
 
 
-  Future<void> _playTestTone() async {
+  // ==========================================================
+  // MENYIAPKAN FILE WAV
+  // ==========================================================
+
+  Future<String> _prepareWavFile() async {
+
+    // --------------------------------------------------------
+    // Membaca file dari Flutter Asset
+    // --------------------------------------------------------
+
+    final ByteData data =
+        await rootBundle.load(
+      'assets/audio/test.wav',
+    );
+
+
+    // --------------------------------------------------------
+    // Mendapatkan folder aplikasi
+    // --------------------------------------------------------
+
+    final Directory directory =
+        await getApplicationDocumentsDirectory();
+
+
+    // --------------------------------------------------------
+    // Membuat file test.wav
+    // --------------------------------------------------------
+
+    final File file =
+        File(
+      '${directory.path}/test.wav',
+    );
+
+
+    // --------------------------------------------------------
+    // Menulis asset menjadi file fisik
+    // --------------------------------------------------------
+
+    await file.writeAsBytes(
+      data.buffer.asUint8List(
+        data.offsetInBytes,
+        data.lengthInBytes,
+      ),
+      flush: true,
+    );
+
+
+    return file.path;
+  }
+
+
+  // ==========================================================
+  // PLAY WAV
+  // ==========================================================
+
+  Future<void> _playWav() async {
 
     try {
 
-      final result =
-          await _channel.invokeMethod<String>(
-        'playTestTone',
-      );
+      setState(() {
+
+        _status =
+            'Menyiapkan file WAV...';
+
+        _isPlaying = false;
+
+      });
+
+
+      // ------------------------------------------------------
+      // Copy asset ke penyimpanan aplikasi
+      // ------------------------------------------------------
+
+      final String path =
+          await _prepareWavFile();
 
 
       setState(() {
 
         _status =
-            result ?? 'Audio dimulai';
+            'Mengirim WAV ke Native Audio Engine...';
+
+      });
+
+
+      // ------------------------------------------------------
+      // Kirim path ke Kotlin
+      // ------------------------------------------------------
+
+      final String? result =
+          await _channel.invokeMethod<String>(
+        'playWav',
+
+        {
+          'path': path,
+        },
+      );
+
+
+      // ------------------------------------------------------
+      // Update UI
+      // ------------------------------------------------------
+
+      setState(() {
+
+        _status =
+            result ?? 'WAV sedang diputar';
+
+        _isPlaying = true;
 
       });
 
@@ -102,18 +237,43 @@ class _HomePageState extends State<HomePage> {
       setState(() {
 
         _status =
-            'Audio Error: ${e.message}';
+            'WAV Error: ${e.message}';
+
+        _isPlaying = false;
+
+      });
+
+    } catch (e) {
+
+      setState(() {
+
+        _status =
+            'Error: $e';
+
+        _isPlaying = false;
 
       });
     }
   }
 
 
+  // ==========================================================
+  // STOP AUDIO
+  // ==========================================================
+
   Future<void> _stopAudio() async {
 
     try {
 
-      final result =
+      setState(() {
+
+        _status =
+            'Menghentikan audio...';
+
+      });
+
+
+      final String? result =
           await _channel.invokeMethod<String>(
         'stopAudio',
       );
@@ -124,6 +284,8 @@ class _HomePageState extends State<HomePage> {
         _status =
             result ?? 'Audio berhenti';
 
+        _isPlaying = false;
+
       });
 
     } on PlatformException catch (e) {
@@ -131,137 +293,275 @@ class _HomePageState extends State<HomePage> {
       setState(() {
 
         _status =
-            'Audio Error: ${e.message}';
+            'Stop Error: ${e.message}';
+
+      });
+    } catch (e) {
+
+      setState(() {
+
+        _status =
+            'Error: $e';
 
       });
     }
   }
 
 
+  // ==========================================================
+  // UI
+  // ==========================================================
+
   @override
   Widget build(BuildContext context) {
 
     return Scaffold(
 
+      // ------------------------------------------------------
+      // APP BAR
+      // ------------------------------------------------------
+
       appBar: AppBar(
+
         title: const Text(
           'Hi-Res Player',
         ),
+
+        centerTitle: true,
       ),
 
 
-      body: Center(
+      // ------------------------------------------------------
+      // BODY
+      // ------------------------------------------------------
 
-        child: Padding(
+      body: SafeArea(
 
-          padding:
-              const EdgeInsets.all(24),
+        child: Center(
 
+          child: SingleChildScrollView(
 
-          child: Column(
-
-            mainAxisAlignment:
-                MainAxisAlignment.center,
-
-
-            children: [
-
-              const Icon(
-                Icons.headphones,
-                size: 80,
-              ),
+            padding:
+                const EdgeInsets.all(24),
 
 
-              const SizedBox(
-                height: 24,
-              ),
+            child: Column(
+
+              mainAxisAlignment:
+                  MainAxisAlignment.center,
 
 
-              const Text(
-                'Native Audio Engine',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight:
-                      FontWeight.bold,
-                ),
-              ),
+              children: [
 
+                // ==========================================
+                // ICON
+                // ==========================================
 
-              const SizedBox(
-                height: 16,
-              ),
+                Icon(
+                  _isPlaying
+                      ? Icons.graphic_eq
+                      : Icons.headphones,
 
-
-              Text(
-                _status,
-                textAlign:
-                    TextAlign.center,
-
-                style: const TextStyle(
-                  fontSize: 18,
-                ),
-              ),
-
-
-              const SizedBox(
-                height: 32,
-              ),
-
-
-              ElevatedButton.icon(
-
-                onPressed:
-                    _testEngine,
-
-                icon: const Icon(
-                  Icons.settings,
+                  size: 90,
                 ),
 
-                label: const Text(
-                  'TEST ENGINE',
-                ),
-              ),
 
-
-              const SizedBox(
-                height: 12,
-              ),
-
-
-              ElevatedButton.icon(
-
-                onPressed:
-                    _playTestTone,
-
-                icon: const Icon(
-                  Icons.play_arrow,
+                const SizedBox(
+                  height: 24,
                 ),
 
-                label: const Text(
-                  'PLAY TEST TONE',
-                ),
-              ),
 
+                // ==========================================
+                // TITLE
+                // ==========================================
 
-              const SizedBox(
-                height: 12,
-              ),
+                const Text(
+                  'Native Audio Engine',
 
-
-              ElevatedButton.icon(
-
-                onPressed:
-                    _stopAudio,
-
-                icon: const Icon(
-                  Icons.stop,
+                  style: TextStyle(
+                    fontSize: 26,
+                    fontWeight:
+                        FontWeight.bold,
+                  ),
                 ),
 
-                label: const Text(
-                  'STOP AUDIO',
+
+                const SizedBox(
+                  height: 12,
                 ),
-              ),
-            ],
+
+
+                // ==========================================
+                // DESCRIPTION
+                // ==========================================
+
+                const Text(
+                  'Flutter → Kotlin → JNI → C++ → AAudio',
+
+                  textAlign:
+                      TextAlign.center,
+
+                  style: TextStyle(
+                    fontSize: 14,
+                  ),
+                ),
+
+
+                const SizedBox(
+                  height: 24,
+                ),
+
+
+                // ==========================================
+                // STATUS CARD
+                // ==========================================
+
+                Card(
+
+                  child: Padding(
+
+                    padding:
+                        const EdgeInsets.all(20),
+
+                    child: Column(
+
+                      children: [
+
+                        const Text(
+                          'STATUS',
+
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight:
+                                FontWeight.bold,
+                          ),
+                        ),
+
+
+                        const SizedBox(
+                          height: 10,
+                        ),
+
+
+                        Text(
+                          _status,
+
+                          textAlign:
+                              TextAlign.center,
+
+                          style: const TextStyle(
+                            fontSize: 17,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+
+                const SizedBox(
+                  height: 30,
+                ),
+
+
+                // ==========================================
+                // TEST ENGINE
+                // ==========================================
+
+                SizedBox(
+
+                  width:
+                      double.infinity,
+
+                  child:
+                      ElevatedButton.icon(
+
+                    onPressed:
+                        _testEngine,
+
+                    icon:
+                        const Icon(
+                      Icons.settings,
+                    ),
+
+                    label:
+                        const Text(
+                      'TEST NATIVE ENGINE',
+                    ),
+                  ),
+                ),
+
+
+                const SizedBox(
+                  height: 12,
+                ),
+
+
+                // ==========================================
+                // PLAY WAV
+                // ==========================================
+
+                SizedBox(
+
+                  width:
+                      double.infinity,
+
+                  child:
+                      ElevatedButton.icon(
+
+                    onPressed:
+                        _isPlaying
+                            ? null
+                            : _playWav,
+
+                    icon:
+                        const Icon(
+                      Icons.play_arrow,
+                    ),
+
+                    label:
+                        const Text(
+                      'PLAY WAV',
+                    ),
+                  ),
+                ),
+
+
+                const SizedBox(
+                  height: 12,
+                ),
+
+
+                // ==========================================
+                // STOP AUDIO
+                // ==========================================
+
+                SizedBox(
+
+                  width:
+                      double.infinity,
+
+                  child:
+                      OutlinedButton.icon(
+
+                    onPressed:
+                        _isPlaying
+                            ? _stopAudio
+                            : null,
+
+                    icon:
+                        const Icon(
+                      Icons.stop,
+                    ),
+
+                    label:
+                        const Text(
+                      'STOP AUDIO',
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

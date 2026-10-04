@@ -16,17 +16,14 @@ class MainActivity : FlutterActivity() {
 
     private external fun nativeGetEngineStatus(): String
 
-    private external fun nativePlayTestTone(): String
+    private external fun nativePlayWav(path: String): String
 
     private external fun nativeStopAudio(): String
-
 
     override fun configureFlutterEngine(
         flutterEngine: FlutterEngine
     ) {
-
         super.configureFlutterEngine(flutterEngine)
-
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -36,7 +33,6 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
 
                 "getEngineStatus" -> {
-
                     try {
 
                         val status =
@@ -54,29 +50,39 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
-
-                "playTestTone" -> {
-
+                "playWav" -> {
                     try {
 
+                        val path =
+                            call.argument<String>("path")
+
+                        if (path == null) {
+
+                            result.error(
+                                "INVALID_PATH",
+                                "Path WAV tidak ditemukan",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
                         val status =
-                            nativePlayTestTone()
+                            nativePlayWav(path)
 
                         result.success(status)
 
                     } catch (e: Exception) {
 
                         result.error(
-                            "AUDIO_ERROR",
+                            "WAV_ERROR",
                             e.message,
                             null
                         )
                     }
                 }
 
-
                 "stopAudio" -> {
-
                     try {
 
                         val status =
@@ -93,7 +99,6 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 }
-
 
                 else -> {
                     result.notImplemented()

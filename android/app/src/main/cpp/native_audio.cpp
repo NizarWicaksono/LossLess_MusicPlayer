@@ -4,6 +4,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+#include <string>
+
 
 #define LOG_TAG "HiResAudio"
 
@@ -14,73 +19,441 @@
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 
-// ===============================
-// Audio Stream
-// ===============================
+// ============================================================
+// Audio
+// ============================================================
 
 static AAudioStream* audioStream = nullptr;
 
+static std::vector<int16_t> pcmData;
 
-// ===============================
-// Variabel generator suara
-// ===============================
+static size_t playbackPosition = 0;
 
-static double phase = 0.0;
+static int32_t wavSampleRate = 0;
 
-static constexpr double FREQUENCY = 440.0;
-static constexpr double AMPLITUDE = 0.20;
+static int32_t wavChannels = 0;
 
 
-// ===============================
-// Callback audio
-// ===============================
+// ============================================================
+// WAV helper
+// ============================================================
 
-aaudio_data_callback_result_t audioCallback(
-        AAudioStream* stream,
-        void* userData,
-        void* audioData,
-        int32_t numFrames
-) {
+uint32_t readUint32(FILE* file) {
 
-    auto* output = static_cast<int16_t*>(audioData);
+    uint8_t buffer[4];
 
-    const int32_t channelCount =
-            AAudioStream_getChannelCount(stream);
+    fread(buffer, 1, 4, file);
 
-    const int32_t sampleRate =
-            AAudioStream_getSampleRate(stream);
+    return
+        static_cast<uint32_t>(buffer[0]) |
+        (static_cast<uint32_t>(buffer[1]) << 8) |
+        (static_cast<uint32_t>(buffer[2]) << 16) |
+        (static_cast<uint32_t>(buffer[3]) << 24);
+}
 
 
-    const double phaseIncrement =
-            (2.0 * M_PI * FREQUENCY) /
-            static_cast<double>(sampleRate);
+uint16_t readUint16(FILE* file) {
+
+    uint8_t buffer[2];
+
+    fread(buffer, 1, 2, file);
+
+    return
+        static_cast<uint16_t>(buffer[0]) |
+        (static_cast<uint16_t>(buffer[1]) << 8);
+}
 
 
-    for (int32_t frame = 0; frame < numFrames; frame++) {
+// ============================================================
+// WAV parser
+// ============================================================
 
-        double sample =
-                std::sin(phase) * AMPLITUDE;
+bool loadWav(const char* path) {
 
-        int16_t pcmSample =
-                static_cast<int16_t>(
-                    sample * 32767.0
-                );
+    LOGI("Membuka WAV:");
+    LOGI("%s", path);
 
 
-        for (int32_t channel = 0;
-             channel < channelCount;
-             channel++) {
+    FILE* file = fopen(path, "rb");
 
-            output[
-                frame * channelCount + channel
-            ] = pcmSample;
+    if (file == nullptr) {
+
+        LOGE("Tidak bisa membuka file WAV");
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // RIFF
+    // --------------------------------------------------------
+
+    char riff[4];
+
+    fread(riff, 1, 4, file);
+
+    if (memcmp(riff, "RIFF", 4) != 0) {
+
+        LOGE("Bukan file RIFF");
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    uint32_t fileSize =
+        readUint32(file);
+
+    (void)fileSize;
+
+
+    // --------------------------------------------------------
+    // WAVE
+    // --------------------------------------------------------
+
+    char wave[4];
+
+    fread(wave, 1, 4, file);
+
+    if (memcmp(wave, "WAVE", 4) != 0) {
+
+        LOGE("Bukan format WAVE");
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    bool foundFmt = false;
+
+    bool foundData = false;
+
+
+    uint16_t audioFormat = 0;
+
+    uint16_t bitsPerSample = 0;
+
+    uint32_t sampleRate = 0;
+
+    uint16_t channels = 0;
+
+    uint32_t dataSize = 0;
+
+    long dataOffset = 0;
+
+
+    // --------------------------------------------------------
+    // Cari chunk
+    // --------------------------------------------------------
+
+    while (!feof(file)) {
+
+        char chunkId[4];
+
+        if (fread(chunkId, 1, 4, file) != 4) {
+            break;
         }
 
 
-        phase += phaseIncrement;
+        uint32_t chunkSize =
+            readUint32(file);
 
-        if (phase >= 2.0 * M_PI) {
-            phase -= 2.0 * M_PI;
+
+        // ----------------------------------------------------
+        // fmt
+        // ----------------------------------------------------
+
+        if (memcmp(chunkId, "fmt ", 4) == 0) {
+
+            audioFormat =
+                readUint16(file);
+
+            channels =
+                readUint16(file);
+
+            sampleRate =
+                readUint32(file);
+
+
+            // byte rate
+            readUint32(file);
+
+            // block align
+            readUint16(file);
+
+            bitsPerSample =
+                readUint16(file);
+
+
+            // Kalau ada data tambahan
+            if (chunkSize > 16) {
+
+                fseek(
+                    file,
+                    chunkSize - 16,
+                    SEEK_CUR
+                );
+            }
+
+
+            foundFmt = true;
+        }
+
+
+        // ----------------------------------------------------
+        // data
+        // ----------------------------------------------------
+
+        else if (memcmp(chunkId, "data", 4) == 0) {
+
+            dataSize = chunkSize;
+
+            dataOffset = ftell(file);
+
+            fseek(
+                file,
+                chunkSize,
+                SEEK_CUR
+            );
+
+            foundData = true;
+        }
+
+
+        // ----------------------------------------------------
+        // Chunk lain
+        // ----------------------------------------------------
+
+        else {
+
+            fseek(
+                file,
+                chunkSize,
+                SEEK_CUR
+            );
+        }
+
+
+        if (foundFmt && foundData) {
+            break;
+        }
+    }
+
+
+    if (!foundFmt) {
+
+        LOGE("Chunk fmt tidak ditemukan");
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    if (!foundData) {
+
+        LOGE("Chunk data tidak ditemukan");
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    // ========================================================
+    // Validasi
+    // ========================================================
+
+    LOGI("==============================");
+    LOGI("WAV INFO");
+    LOGI("Sample Rate : %u Hz", sampleRate);
+    LOGI("Channels    : %u", channels);
+    LOGI("Bit Depth   : %u bit", bitsPerSample);
+    LOGI("Audio Format: %u", audioFormat);
+    LOGI("Data Size   : %u bytes", dataSize);
+    LOGI("==============================");
+
+
+    // PCM = 1
+    if (audioFormat != 1) {
+
+        LOGE(
+            "Format audio bukan PCM."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    if (bitsPerSample != 16) {
+
+        LOGE(
+            "Untuk tahap ini hanya mendukung 16-bit."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    if (channels < 1 || channels > 2) {
+
+        LOGE(
+            "Untuk tahap ini hanya mendukung 1 atau 2 channel."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    // ========================================================
+    // Baca PCM
+    // ========================================================
+
+    pcmData.resize(
+        dataSize / sizeof(int16_t)
+    );
+
+
+    fseek(
+        file,
+        dataOffset,
+        SEEK_SET
+    );
+
+
+    size_t samplesRead =
+        fread(
+            pcmData.data(),
+            sizeof(int16_t),
+            pcmData.size(),
+            file
+        );
+
+
+    fclose(file);
+
+
+    if (samplesRead != pcmData.size()) {
+
+        LOGE(
+            "Jumlah PCM yang terbaca tidak sesuai."
+        );
+
+        pcmData.clear();
+
+        return false;
+    }
+
+
+    wavSampleRate =
+        static_cast<int32_t>(sampleRate);
+
+    wavChannels =
+        static_cast<int32_t>(channels);
+
+
+    playbackPosition = 0;
+
+
+    LOGI(
+        "PCM berhasil dimuat: %zu samples",
+        pcmData.size()
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// AAudio callback
+// ============================================================
+
+aaudio_data_callback_result_t audioCallback(
+    AAudioStream* stream,
+    void* userData,
+    void* audioData,
+    int32_t numFrames
+) {
+
+    auto* output =
+        static_cast<int16_t*>(audioData);
+
+
+    int32_t channels =
+        AAudioStream_getChannelCount(
+            stream
+        );
+
+
+    size_t totalSamples =
+        pcmData.size();
+
+
+    for (int32_t frame = 0;
+         frame < numFrames;
+         frame++) {
+
+
+        for (int32_t channel = 0;
+             channel < channels;
+             channel++) {
+
+
+            size_t index =
+                playbackPosition +
+                channel;
+
+
+            if (index < totalSamples) {
+
+                output[
+                    frame * channels + channel
+                ] = pcmData[index];
+
+            } else {
+
+                output[
+                    frame * channels + channel
+                ] = 0;
+            }
+        }
+
+
+        playbackPosition += channels;
+
+
+        // ----------------------------------------------------
+        // Lagu selesai
+        // ----------------------------------------------------
+
+        if (playbackPosition >= totalSamples) {
+
+            for (int32_t remainingFrame = frame + 1;
+                 remainingFrame < numFrames;
+                 remainingFrame++) {
+
+                for (int32_t channel = 0;
+                     channel < channels;
+                     channel++) {
+
+                    output[
+                        remainingFrame * channels +
+                        channel
+                    ] = 0;
+                }
+            }
+
+
+            return AAUDIO_CALLBACK_RESULT_STOP;
         }
     }
 
@@ -89,68 +462,100 @@ aaudio_data_callback_result_t audioCallback(
 }
 
 
-// ===============================
+// ============================================================
 // Error callback
-// ===============================
+// ============================================================
 
 void errorCallback(
-        AAudioStream* stream,
-        void* userData,
-        aaudio_result_t error
+    AAudioStream* stream,
+    void* userData,
+    aaudio_result_t error
 ) {
 
     LOGE(
-        "AAudio error callback: %s",
+        "AAudio error: %s",
         AAudio_convertResultToText(error)
     );
 }
 
 
-// ===============================
-// Start Audio
-// ===============================
+// ============================================================
+// Play WAV
+// ============================================================
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_example_hires_1player_MainActivity_nativePlayTestTone(
-        JNIEnv* env,
-        jobject /* this */
+Java_com_example_hires_1player_MainActivity_nativePlayWav(
+    JNIEnv* env,
+    jobject /* this */,
+    jstring path
 ) {
 
-    LOGI("==============================");
-    LOGI("Memulai AAudio test tone...");
-    LOGI("==============================");
+    const char* filePath =
+        env->GetStringUTFChars(
+            path,
+            nullptr
+        );
 
 
-    // Kalau sebelumnya masih berjalan,
-    // tutup terlebih dahulu.
+    // --------------------------------------------------------
+    // Load WAV
+    // --------------------------------------------------------
+
+    bool loaded =
+        loadWav(filePath);
+
+
+    env->ReleaseStringUTFChars(
+        path,
+        filePath
+    );
+
+
+    if (!loaded) {
+
+        return env->NewStringUTF(
+            "Gagal membaca WAV"
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Tutup stream sebelumnya
+    // --------------------------------------------------------
 
     if (audioStream != nullptr) {
 
-        AAudioStream_requestStop(audioStream);
-        AAudioStream_close(audioStream);
+        AAudioStream_requestStop(
+            audioStream
+        );
+
+        AAudioStream_close(
+            audioStream
+        );
 
         audioStream = nullptr;
     }
 
 
-    phase = 0.0;
-
-
-    // ===============================
+    // --------------------------------------------------------
     // Builder
-    // ===============================
+    // --------------------------------------------------------
 
-    AAudioStreamBuilder* builder = nullptr;
+    AAudioStreamBuilder* builder =
+        nullptr;
+
 
     aaudio_result_t result =
-            AAudio_createStreamBuilder(&builder);
+        AAudio_createStreamBuilder(
+            &builder
+        );
 
 
     if (result != AAUDIO_OK) {
 
         LOGE(
-            "Gagal membuat builder: %s",
+            "Gagal membuat AAudio builder: %s",
             AAudio_convertResultToText(result)
         );
 
@@ -159,10 +564,6 @@ Java_com_example_hires_1player_MainActivity_nativePlayTestTone(
         );
     }
 
-
-    // ===============================
-    // Konfigurasi
-    // ===============================
 
     AAudioStreamBuilder_setDirection(
         builder,
@@ -190,13 +591,13 @@ Java_com_example_hires_1player_MainActivity_nativePlayTestTone(
 
     AAudioStreamBuilder_setChannelCount(
         builder,
-        2
+        wavChannels
     );
 
 
     AAudioStreamBuilder_setSampleRate(
         builder,
-        48000
+        wavSampleRate
     );
 
 
@@ -214,119 +615,118 @@ Java_com_example_hires_1player_MainActivity_nativePlayTestTone(
     );
 
 
-    // ===============================
-    // Open stream
-    // ===============================
+    // --------------------------------------------------------
+    // Open
+    // --------------------------------------------------------
 
     result =
-            AAudioStreamBuilder_openStream(
-                builder,
-                &audioStream
-            );
+        AAudioStreamBuilder_openStream(
+            builder,
+            &audioStream
+        );
 
 
-    AAudioStreamBuilder_delete(builder);
+    AAudioStreamBuilder_delete(
+        builder
+    );
 
 
     if (result != AAUDIO_OK) {
 
         LOGE(
-            "Gagal membuka stream: %s",
+            "Gagal membuka AAudio: %s",
             AAudio_convertResultToText(result)
         );
 
         audioStream = nullptr;
 
         return env->NewStringUTF(
-            "Gagal membuka AAudio stream"
+            "Gagal membuka AAudio"
         );
     }
 
 
-    // ===============================
-    // Cek konfigurasi aktual
-    // ===============================
+    // --------------------------------------------------------
+    // Informasi aktual
+    // --------------------------------------------------------
 
     int32_t actualSampleRate =
-            AAudioStream_getSampleRate(
-                audioStream
-            );
+        AAudioStream_getSampleRate(
+            audioStream
+        );
+
 
     int32_t actualChannels =
-            AAudioStream_getChannelCount(
-                audioStream
-            );
-
-    aaudio_format_t actualFormat =
-            AAudioStream_getFormat(
-                audioStream
-            );
+        AAudioStream_getChannelCount(
+            audioStream
+        );
 
 
     LOGI(
-        "Sample Rate: %d Hz",
+        "Actual Sample Rate: %d Hz",
         actualSampleRate
     );
 
+
     LOGI(
-        "Channels: %d",
+        "Actual Channels: %d",
         actualChannels
     );
 
-    LOGI(
-        "Format: %d",
-        actualFormat
-    );
 
-
-    // ===============================
+    // --------------------------------------------------------
     // Start
-    // ===============================
+    // --------------------------------------------------------
 
     result =
-            AAudioStream_requestStart(
-                audioStream
-            );
+        AAudioStream_requestStart(
+            audioStream
+        );
 
 
     if (result != AAUDIO_OK) {
 
         LOGE(
-            "Gagal start stream: %s",
+            "Gagal start AAudio: %s",
             AAudio_convertResultToText(result)
         );
 
-        AAudioStream_close(audioStream);
+
+        AAudioStream_close(
+            audioStream
+        );
+
 
         audioStream = nullptr;
 
+
         return env->NewStringUTF(
-            "Gagal menjalankan audio"
+            "Gagal menjalankan WAV"
         );
     }
 
 
-    LOGI("AAudio berhasil dimulai!");
+    LOGI(
+        "WAV mulai diputar."
+    );
+
 
     return env->NewStringUTF(
-        "AAudio aktif - 440 Hz"
+        "WAV sedang diputar"
     );
 }
 
 
-// ===============================
-// Stop Audio
-// ===============================
+// ============================================================
+// Stop
+// ============================================================
 
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_example_hires_1player_MainActivity_nativeStopAudio(
-        JNIEnv* env,
-        jobject /* this */
+    JNIEnv* env,
+    jobject /* this */
 ) {
-
-    LOGI("Menghentikan audio...");
-
 
     if (audioStream != nullptr) {
 
@@ -334,15 +734,24 @@ Java_com_example_hires_1player_MainActivity_nativeStopAudio(
             audioStream
         );
 
+
         AAudioStream_close(
             audioStream
         );
+
 
         audioStream = nullptr;
     }
 
 
-    LOGI("Audio berhenti.");
+    pcmData.clear();
+
+    playbackPosition = 0;
+
+
+    LOGI(
+        "Audio dihentikan."
+    );
 
 
     return env->NewStringUTF(
@@ -351,18 +760,16 @@ Java_com_example_hires_1player_MainActivity_nativeStopAudio(
 }
 
 
-// ===============================
+// ============================================================
 // Engine Status
-// ===============================
+// ============================================================
 
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_example_hires_1player_MainActivity_nativeGetEngineStatus(
-        JNIEnv* env,
-        jobject /* this */
+    JNIEnv* env,
+    jobject /* this */
 ) {
-
-    LOGI("Native Audio Engine dipanggil!");
 
     return env->NewStringUTF(
         "Native Audio Engine Connected"
