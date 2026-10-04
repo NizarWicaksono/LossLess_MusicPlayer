@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "Android C++",
+            "includePath": [
+                "${workspaceFolder}/android/app/src/main/cpp/**",
+                "C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot/include",
+                "C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot/include/win32"
+            ],
+            "defines": [],
+            "compilerPath": "",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-gcc-x64"
+        }
+    ],
+    "version": 4
+}
