@@ -1,17 +1,17 @@
 {
     "configurations": [
         {
-            "name": "Android C++",
+            "name": "Android",
             "includePath": [
-                "${workspaceFolder}/android/app/src/main/cpp/**",
-                "C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot/include",
-                "C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot/include/win32"
+                "${workspaceFolder}/**",
+                "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
+                "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/include"
             ],
             "defines": [],
-            "compilerPath": "",
+            "compilerPath": "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe",
             "cStandard": "c17",
             "cppStandard": "c++17",
-            "intelliSenseMode": "windows-gcc-x64"
+            "intelliSenseMode": "windows-clang-x64"
         }
     ],
     "version": 4
