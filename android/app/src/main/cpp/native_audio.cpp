@@ -2,12 +2,15 @@
 #include <android/log.h>
 #include <aaudio/AAudio.h>
 
-#include <cmath>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <vector>
 #include <string>
+#include <thread>
+#include <vector>
 
 
 #define LOG_TAG "HiResAudio"
@@ -20,44 +23,99 @@
 
 
 // ============================================================
-// Audio
+// AAudio
 // ============================================================
 
 static AAudioStream* audioStream = nullptr;
-
-static std::vector<int16_t> pcmData;
-
-static size_t playbackPosition = 0;
 
 
 // ============================================================
 // WAV Metadata
 // ============================================================
 
-// Path file WAV yang sedang digunakan
 static std::string wavFilePath;
 
-// Sample rate WAV
 static int32_t wavSampleRate = 0;
-
-// Jumlah channel WAV
 static int32_t wavChannels = 0;
-
-// Bit depth WAV
 static int32_t wavBitsPerSample = 0;
-
-// Format audio
-// PCM = 1
 static int32_t wavAudioFormat = 0;
 
-// Posisi awal chunk "data" di dalam file
 static long wavDataOffset = 0;
 
-// Ukuran data PCM
 static uint32_t wavDataSize = 0;
 
-// Jumlah frame audio
 static uint64_t wavTotalFrames = 0;
+
+
+// ============================================================
+// Lock-Free SPSC Ring Buffer
+// ============================================================
+//
+// SPSC = Single Producer, Single Consumer
+//
+// Producer:
+//     Reader Thread
+//
+// Consumer:
+//     AAudio Callback
+//
+// Tidak menggunakan mutex.
+//
+// ============================================================
+
+// 65536 sample
+//
+// Karena PCM 16-bit:
+//
+// 65536 * 2 byte
+// = 131072 byte
+// = 128 KiB
+//
+static constexpr size_t RING_BUFFER_CAPACITY = 65536;
+
+
+// Buffer PCM
+static std::vector<int16_t> ringBuffer(
+    RING_BUFFER_CAPACITY
+);
+
+
+// ------------------------------------------------------------
+// Atomic index
+// ------------------------------------------------------------
+//
+// writeIndex:
+// hanya ditulis Reader Thread
+//
+// readIndex:
+// hanya ditulis AAudio Callback
+//
+// Keduanya dibaca oleh thread lainnya.
+//
+
+static std::atomic<size_t> ringWriteIndex(0);
+
+static std::atomic<size_t> ringReadIndex(0);
+
+
+// ============================================================
+// Reader Thread State
+// ============================================================
+
+static std::thread readerThread;
+
+static std::atomic<bool> readerRunning(false);
+
+static std::atomic<bool> readerStopRequested(false);
+
+static std::atomic<bool> endOfFileReached(false);
+
+
+// ============================================================
+// Playback State
+// ============================================================
+
+static std::atomic<bool> playbackFinished(false);
 
 
 // ============================================================
@@ -68,7 +126,14 @@ uint32_t readUint32(FILE* file)
 {
     uint8_t buffer[4];
 
-    if (fread(buffer, 1, 4, file) != 4)
+    if (
+        fread(
+            buffer,
+            1,
+            4,
+            file
+        ) != 4
+    )
     {
         return 0;
     }
@@ -85,7 +150,14 @@ uint16_t readUint16(FILE* file)
 {
     uint8_t buffer[2];
 
-    if (fread(buffer, 1, 2, file) != 2)
+    if (
+        fread(
+            buffer,
+            1,
+            2,
+            file
+        ) != 2
+    )
     {
         return 0;
     }
@@ -93,6 +165,290 @@ uint16_t readUint16(FILE* file)
     return
         static_cast<uint16_t>(buffer[0]) |
         (static_cast<uint16_t>(buffer[1]) << 8);
+}
+
+
+// ============================================================
+// Ring Buffer Reset
+// ============================================================
+
+void resetRingBuffer()
+{
+    ringReadIndex.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    ringWriteIndex.store(
+        0,
+        std::memory_order_relaxed
+    );
+}
+
+
+// ============================================================
+// Ring Buffer - Available Samples
+// ============================================================
+
+size_t getAvailableSamples()
+{
+    size_t writeIndex =
+        ringWriteIndex.load(
+            std::memory_order_acquire
+        );
+
+    size_t readIndex =
+        ringReadIndex.load(
+            std::memory_order_acquire
+        );
+
+
+    if (writeIndex >= readIndex)
+    {
+        return writeIndex - readIndex;
+    }
+
+
+    return
+        RING_BUFFER_CAPACITY
+        -
+        readIndex
+        +
+        writeIndex;
+}
+
+
+// ============================================================
+// Ring Buffer - Free Space
+// ============================================================
+//
+// Satu slot sengaja dikosongkan agar kondisi:
+//
+// write == read
+//
+// selalu berarti EMPTY.
+//
+// ============================================================
+
+size_t getFreeSamples()
+{
+    return
+        (RING_BUFFER_CAPACITY - 1)
+        -
+        getAvailableSamples();
+}
+
+
+// ============================================================
+// Ring Buffer - Write
+// ============================================================
+//
+// Hanya dipanggil Reader Thread.
+//
+// ============================================================
+
+size_t writeToRingBuffer(
+    const int16_t* source,
+    size_t sampleCount
+)
+{
+    size_t writeIndex =
+        ringWriteIndex.load(
+            std::memory_order_relaxed
+        );
+
+
+    size_t readIndex =
+        ringReadIndex.load(
+            std::memory_order_acquire
+        );
+
+
+    size_t availableSpace;
+
+
+    if (writeIndex >= readIndex)
+    {
+        availableSpace =
+            RING_BUFFER_CAPACITY
+            -
+            writeIndex
+            +
+            readIndex
+            -
+            1;
+    }
+    else
+    {
+        availableSpace =
+            readIndex
+            -
+            writeIndex
+            -
+            1;
+    }
+
+
+    size_t samplesToWrite =
+        std::min(
+            sampleCount,
+            availableSpace
+        );
+
+
+    for (
+        size_t i = 0;
+        i < samplesToWrite;
+        i++
+    )
+    {
+        ringBuffer[writeIndex] =
+            source[i];
+
+
+        writeIndex++;
+
+
+        if (
+            writeIndex
+            >=
+            RING_BUFFER_CAPACITY
+        )
+        {
+            writeIndex = 0;
+        }
+    }
+
+
+    // Publish data setelah semua sample selesai ditulis.
+    ringWriteIndex.store(
+        writeIndex,
+        std::memory_order_release
+    );
+
+
+    return samplesToWrite;
+}
+
+
+// ============================================================
+// Ring Buffer - Read
+// ============================================================
+//
+// Hanya dipanggil AAudio Callback.
+//
+// Tidak menggunakan mutex.
+//
+// Tidak melakukan allocation.
+//
+// Tidak melakukan fread().
+//
+// ============================================================
+
+size_t readFromRingBuffer(
+    int16_t* destination,
+    size_t sampleCount
+)
+{
+    size_t readIndex =
+        ringReadIndex.load(
+            std::memory_order_relaxed
+        );
+
+
+    size_t writeIndex =
+        ringWriteIndex.load(
+            std::memory_order_acquire
+        );
+
+
+    size_t availableSamples;
+
+
+    if (writeIndex >= readIndex)
+    {
+        availableSamples =
+            writeIndex
+            -
+            readIndex;
+    }
+    else
+    {
+        availableSamples =
+            RING_BUFFER_CAPACITY
+            -
+            readIndex
+            +
+            writeIndex;
+    }
+
+
+    size_t samplesToRead =
+        std::min(
+            sampleCount,
+            availableSamples
+        );
+
+
+    for (
+        size_t i = 0;
+        i < samplesToRead;
+        i++
+    )
+    {
+        destination[i] =
+            ringBuffer[readIndex];
+
+
+        readIndex++;
+
+
+        if (
+            readIndex
+            >=
+            RING_BUFFER_CAPACITY
+        )
+        {
+            readIndex = 0;
+        }
+    }
+
+
+    // Publish posisi read baru.
+    ringReadIndex.store(
+        readIndex,
+        std::memory_order_release
+    );
+
+
+    return samplesToRead;
+}
+
+
+// ============================================================
+// Stop Reader Thread
+// ============================================================
+
+void stopReaderThread()
+{
+    readerStopRequested.store(
+        true,
+        std::memory_order_release
+    );
+
+
+    if (
+        readerThread.joinable()
+    )
+    {
+        readerThread.join();
+    }
+
+
+    readerRunning.store(
+        false,
+        std::memory_order_release
+    );
 }
 
 
@@ -117,8 +473,294 @@ void resetWavState()
     wavDataSize = 0;
 
     wavTotalFrames = 0;
+}
 
-    playbackPosition = 0;
+
+// ============================================================
+// Reader Thread
+// ============================================================
+
+void readerThreadFunction()
+{
+    LOGI(
+        "SPSC Reader Thread dimulai."
+    );
+
+
+    readerRunning.store(
+        true,
+        std::memory_order_release
+    );
+
+
+    // --------------------------------------------------------
+    // Buka file WAV
+    // --------------------------------------------------------
+
+    FILE* file =
+        fopen(
+            wavFilePath.c_str(),
+            "rb"
+        );
+
+
+    if (file == nullptr)
+    {
+        LOGE(
+            "Reader gagal membuka WAV."
+        );
+
+
+        endOfFileReached.store(
+            true,
+            std::memory_order_release
+        );
+
+
+        readerRunning.store(
+            false,
+            std::memory_order_release
+        );
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Menuju awal PCM
+    // --------------------------------------------------------
+
+    if (
+        fseek(
+            file,
+            wavDataOffset,
+            SEEK_SET
+        ) != 0
+    )
+    {
+        LOGE(
+            "Reader gagal menuju data PCM."
+        );
+
+
+        fclose(file);
+
+
+        endOfFileReached.store(
+            true,
+            std::memory_order_release
+        );
+
+
+        readerRunning.store(
+            false,
+            std::memory_order_release
+        );
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Temporary read buffer
+    // --------------------------------------------------------
+
+    constexpr size_t READ_CHUNK_SAMPLES =
+        4096;
+
+
+    std::vector<int16_t> readBuffer(
+        READ_CHUNK_SAMPLES
+    );
+
+
+    uint64_t totalSamplesRead = 0;
+
+
+    // ========================================================
+    // Streaming loop
+    // ========================================================
+
+    while (
+        !readerStopRequested.load(
+            std::memory_order_acquire
+        )
+    )
+    {
+        // ----------------------------------------------------
+        // Cek ruang ring buffer
+        // ----------------------------------------------------
+
+        size_t freeSamples =
+            getFreeSamples();
+
+
+        if (freeSamples == 0)
+        {
+            // Buffer penuh.
+            //
+            // Reader bukan melakukan busy-loop
+            // terus menerus.
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1)
+            );
+
+            continue;
+        }
+
+
+        size_t samplesToRead =
+            std::min(
+                freeSamples,
+                READ_CHUNK_SAMPLES
+            );
+
+
+        // ----------------------------------------------------
+        // Jangan membaca melewati data WAV
+        // ----------------------------------------------------
+
+        uint64_t bytesAlreadyRead =
+            totalSamplesRead
+            *
+            sizeof(int16_t);
+
+
+        if (
+            bytesAlreadyRead
+            >=
+            wavDataSize
+        )
+        {
+            break;
+        }
+
+
+        uint64_t bytesRemaining =
+            wavDataSize
+            -
+            bytesAlreadyRead;
+
+
+        size_t maxSamplesByFile =
+            static_cast<size_t>(
+                bytesRemaining
+                /
+                sizeof(int16_t)
+            );
+
+
+        if (
+            samplesToRead
+            >
+            maxSamplesByFile
+        )
+        {
+            samplesToRead =
+                maxSamplesByFile;
+        }
+
+
+        if (samplesToRead == 0)
+        {
+            break;
+        }
+
+
+        // ----------------------------------------------------
+        // Baca dari file
+        // ----------------------------------------------------
+
+        size_t samplesRead =
+            fread(
+                readBuffer.data(),
+                sizeof(int16_t),
+                samplesToRead,
+                file
+            );
+
+
+        if (samplesRead == 0)
+        {
+            LOGE(
+                "Reader gagal membaca PCM."
+            );
+
+            break;
+        }
+
+
+        // ----------------------------------------------------
+        // Masukkan ke ring buffer
+        // ----------------------------------------------------
+
+        size_t offset = 0;
+
+
+        while (
+            offset < samplesRead
+            &&
+            !readerStopRequested.load(
+                std::memory_order_acquire
+            )
+        )
+        {
+            size_t written =
+                writeToRingBuffer(
+                    readBuffer.data() + offset,
+                    samplesRead - offset
+                );
+
+
+            offset += written;
+
+
+            if (written == 0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1)
+                );
+            }
+        }
+
+
+        totalSamplesRead +=
+            offset;
+    }
+
+
+    fclose(file);
+
+
+    // ========================================================
+    // Reader selesai
+    // ========================================================
+
+    endOfFileReached.store(
+        true,
+        std::memory_order_release
+    );
+
+
+    readerRunning.store(
+        false,
+        std::memory_order_release
+    );
+
+
+    LOGI(
+        "SPSC Reader Thread selesai."
+    );
+
+
+    LOGI(
+        "Total samples: %llu",
+        static_cast<unsigned long long>(
+            totalSamplesRead
+        )
+    );
 }
 
 
@@ -126,35 +768,68 @@ void resetWavState()
 // WAV Parser
 // ============================================================
 
-bool loadWav(const char* path)
+bool loadWav(
+    const char* path
+)
 {
-    LOGI("================================");
+    LOGI(
+        "================================"
+    );
 
-    LOGI("Membuka WAV:");
+    LOGI(
+        "Membuka WAV:"
+    );
 
-    LOGI("%s", path);
+    LOGI(
+        "%s",
+        path
+    );
 
-    LOGI("================================");
+    LOGI(
+        "================================"
+    );
 
 
     // --------------------------------------------------------
-    // Reset state sebelumnya
+    // Pastikan reader lama berhenti
     // --------------------------------------------------------
+
+    stopReaderThread();
+
+
+    resetRingBuffer();
 
     resetWavState();
 
-    pcmData.clear();
+
+    endOfFileReached.store(
+        false,
+        std::memory_order_release
+    );
+
+
+    playbackFinished.store(
+        false,
+        std::memory_order_release
+    );
 
 
     // --------------------------------------------------------
     // Buka file
     // --------------------------------------------------------
 
-    FILE* file = fopen(path, "rb");
+    FILE* file =
+        fopen(
+            path,
+            "rb"
+        );
+
 
     if (file == nullptr)
     {
-        LOGE("Tidak bisa membuka file WAV");
+        LOGE(
+            "Tidak bisa membuka WAV."
+        );
 
         return false;
     }
@@ -166,9 +841,19 @@ bool loadWav(const char* path)
 
     char riff[4];
 
-    if (fread(riff, 1, 4, file) != 4)
+
+    if (
+        fread(
+            riff,
+            1,
+            4,
+            file
+        ) != 4
+    )
     {
-        LOGE("Gagal membaca header RIFF");
+        LOGE(
+            "Gagal membaca RIFF."
+        );
 
         fclose(file);
 
@@ -176,9 +861,17 @@ bool loadWav(const char* path)
     }
 
 
-    if (memcmp(riff, "RIFF", 4) != 0)
+    if (
+        memcmp(
+            riff,
+            "RIFF",
+            4
+        ) != 0
+    )
     {
-        LOGE("Bukan file RIFF");
+        LOGE(
+            "File bukan RIFF."
+        );
 
         fclose(file);
 
@@ -186,7 +879,10 @@ bool loadWav(const char* path)
     }
 
 
-    uint32_t fileSize = readUint32(file);
+    // File size
+    uint32_t fileSize =
+        readUint32(file);
+
 
     (void)fileSize;
 
@@ -197,9 +893,19 @@ bool loadWav(const char* path)
 
     char wave[4];
 
-    if (fread(wave, 1, 4, file) != 4)
+
+    if (
+        fread(
+            wave,
+            1,
+            4,
+            file
+        ) != 4
+    )
     {
-        LOGE("Gagal membaca header WAVE");
+        LOGE(
+            "Gagal membaca WAVE."
+        );
 
         fclose(file);
 
@@ -207,9 +913,17 @@ bool loadWav(const char* path)
     }
 
 
-    if (memcmp(wave, "WAVE", 4) != 0)
+    if (
+        memcmp(
+            wave,
+            "WAVE",
+            4
+        ) != 0
+    )
     {
-        LOGE("Bukan format WAVE");
+        LOGE(
+            "File bukan WAVE."
+        );
 
         fclose(file);
 
@@ -218,7 +932,7 @@ bool loadWav(const char* path)
 
 
     // --------------------------------------------------------
-    // Variabel parser
+    // Parser state
     // --------------------------------------------------------
 
     bool foundFmt = false;
@@ -228,63 +942,110 @@ bool loadWav(const char* path)
 
     uint16_t audioFormat = 0;
 
-    uint16_t bitsPerSample = 0;
+    uint16_t channels = 0;
 
     uint32_t sampleRate = 0;
 
-    uint16_t channels = 0;
+    uint16_t bitsPerSample = 0;
 
     uint32_t dataSize = 0;
 
     long dataOffset = 0;
 
 
-    // --------------------------------------------------------
-    // Cari chunk
-    // --------------------------------------------------------
+    // ========================================================
+    // Cari chunk fmt dan data
+    // ========================================================
 
     while (!feof(file))
     {
         char chunkId[4];
 
 
-        if (fread(chunkId, 1, 4, file) != 4)
+        if (
+            fread(
+                chunkId,
+                1,
+                4,
+                file
+            ) != 4
+        )
         {
             break;
         }
 
 
-        uint32_t chunkSize = readUint32(file);
+        uint32_t chunkSize =
+            readUint32(file);
 
 
         // ----------------------------------------------------
         // fmt
         // ----------------------------------------------------
 
-        if (memcmp(chunkId, "fmt ", 4) == 0)
+        if (
+            memcmp(
+                chunkId,
+                "fmt ",
+                4
+            ) == 0
+        )
         {
-            audioFormat = readUint16(file);
+            audioFormat =
+                readUint16(file);
 
-            channels = readUint16(file);
 
-            sampleRate = readUint32(file);
+            channels =
+                readUint16(file);
+
+
+            sampleRate =
+                readUint32(file);
 
 
             // Byte rate
             readUint32(file);
 
+
             // Block align
             readUint16(file);
 
-            bitsPerSample = readUint16(file);
+
+            bitsPerSample =
+                readUint16(file);
 
 
-            // Kalau ada data tambahan
+            // ------------------------------------------------
+            // Extra fmt data
+            // ------------------------------------------------
+
             if (chunkSize > 16)
+            {
+                long remaining =
+                    static_cast<long>(
+                        chunkSize - 16
+                    );
+
+
+                fseek(
+                    file,
+                    remaining,
+                    SEEK_CUR
+                );
+            }
+
+
+            // ------------------------------------------------
+            // WAV chunk padding
+            // ------------------------------------------------
+
+            if (
+                chunkSize & 1
+            )
             {
                 fseek(
                     file,
-                    static_cast<long>(chunkSize - 16),
+                    1,
                     SEEK_CUR
                 );
             }
@@ -298,18 +1059,43 @@ bool loadWav(const char* path)
         // data
         // ----------------------------------------------------
 
-        else if (memcmp(chunkId, "data", 4) == 0)
+        else if (
+            memcmp(
+                chunkId,
+                "data",
+                4
+            ) == 0
+        )
         {
-            dataSize = chunkSize;
+            dataSize =
+                chunkSize;
 
-            dataOffset = ftell(file);
+
+            dataOffset =
+                ftell(file);
 
 
+            // Lewati data sementara parser
             fseek(
                 file,
-                static_cast<long>(chunkSize),
+                static_cast<long>(
+                    chunkSize
+                ),
                 SEEK_CUR
             );
+
+
+            // Padding RIFF
+            if (
+                chunkSize & 1
+            )
+            {
+                fseek(
+                    file,
+                    1,
+                    SEEK_CUR
+                );
+            }
 
 
             foundData = true;
@@ -324,17 +1110,31 @@ bool loadWav(const char* path)
         {
             fseek(
                 file,
-                static_cast<long>(chunkSize),
+                static_cast<long>(
+                    chunkSize
+                ),
                 SEEK_CUR
             );
+
+
+            if (
+                chunkSize & 1
+            )
+            {
+                fseek(
+                    file,
+                    1,
+                    SEEK_CUR
+                );
+            }
         }
 
 
-        // ----------------------------------------------------
-        // Kalau sudah ketemu dua-duanya
-        // ----------------------------------------------------
-
-        if (foundFmt && foundData)
+        if (
+            foundFmt
+            &&
+            foundData
+        )
         {
             break;
         }
@@ -342,12 +1142,14 @@ bool loadWav(const char* path)
 
 
     // --------------------------------------------------------
-    // Validasi chunk
+    // Validasi
     // --------------------------------------------------------
 
     if (!foundFmt)
     {
-        LOGE("Chunk fmt tidak ditemukan");
+        LOGE(
+            "Chunk fmt tidak ditemukan."
+        );
 
         fclose(file);
 
@@ -357,75 +1159,8 @@ bool loadWav(const char* path)
 
     if (!foundData)
     {
-        LOGE("Chunk data tidak ditemukan");
-
-        fclose(file);
-
-        return false;
-    }
-
-
-    // ========================================================
-    // Validasi format
-    // ========================================================
-
-    LOGI("==============================");
-
-    LOGI("WAV INFO");
-
-    LOGI("Sample Rate : %u Hz", sampleRate);
-
-    LOGI("Channels    : %u", channels);
-
-    LOGI("Bit Depth   : %u bit", bitsPerSample);
-
-    LOGI("Audio Format: %u", audioFormat);
-
-    LOGI("Data Size   : %u bytes", dataSize);
-
-    LOGI("Data Offset : %ld", dataOffset);
-
-    LOGI("==============================");
-
-
-    // --------------------------------------------------------
-    // PCM = 1
-    // --------------------------------------------------------
-
-    if (audioFormat != 1)
-    {
-        LOGE("Format audio bukan PCM.");
-
-        fclose(file);
-
-        return false;
-    }
-
-
-    // --------------------------------------------------------
-    // Untuk sekarang masih 16-bit
-    // --------------------------------------------------------
-
-    if (bitsPerSample != 16)
-    {
         LOGE(
-            "Untuk tahap ini hanya mendukung 16-bit."
-        );
-
-        fclose(file);
-
-        return false;
-    }
-
-
-    // --------------------------------------------------------
-    // Untuk sekarang 1 atau 2 channel
-    // --------------------------------------------------------
-
-    if (channels < 1 || channels > 2)
-    {
-        LOGE(
-            "Untuk tahap ini hanya mendukung 1 atau 2 channel."
+            "Chunk data tidak ditemukan."
         );
 
         fclose(file);
@@ -435,148 +1170,254 @@ bool loadWav(const char* path)
 
 
     // ========================================================
-    // Simpan metadata ke state global
+    // WAV Information
     // ========================================================
 
-    wavFilePath = path;
+    LOGI(
+        "=============================="
+    );
 
-    wavSampleRate =
-        static_cast<int32_t>(sampleRate);
+    LOGI(
+        "WAV INFO"
+    );
 
-    wavChannels =
-        static_cast<int32_t>(channels);
+    LOGI(
+        "Sample Rate : %u Hz",
+        sampleRate
+    );
 
-    wavBitsPerSample =
-        static_cast<int32_t>(bitsPerSample);
+    LOGI(
+        "Channels    : %u",
+        channels
+    );
 
-    wavAudioFormat =
-        static_cast<int32_t>(audioFormat);
+    LOGI(
+        "Bit Depth   : %u bit",
+        bitsPerSample
+    );
 
-    wavDataOffset = dataOffset;
+    LOGI(
+        "Audio Format: %u",
+        audioFormat
+    );
 
-    wavDataSize = dataSize;
+    LOGI(
+        "Data Size   : %u bytes",
+        dataSize
+    );
+
+    LOGI(
+        "Data Offset : %ld",
+        dataOffset
+    );
+
+    LOGI(
+        "=============================="
+    );
 
 
-    // Jumlah frame:
-    //
-    // dataSize
-    // --------
-    // bytes per sample × jumlah channel
-    //
+    // --------------------------------------------------------
+    // PCM
+    // --------------------------------------------------------
+
+    if (
+        audioFormat != 1
+    )
+    {
+        LOGE(
+            "WAV bukan PCM."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // 16-bit
+    // --------------------------------------------------------
+
+    if (
+        bitsPerSample != 16
+    )
+    {
+        LOGE(
+            "Versi ini hanya mendukung PCM 16-bit."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Channel
+    // --------------------------------------------------------
+
+    if (
+        channels < 1
+        ||
+        channels > 2
+    )
+    {
+        LOGE(
+            "Versi ini hanya mendukung 1-2 channel."
+        );
+
+        fclose(file);
+
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // Data harus valid
+    // --------------------------------------------------------
+
     uint32_t bytesPerSample =
         bitsPerSample / 8;
 
 
     uint32_t bytesPerFrame =
-        bytesPerSample * channels;
+        bytesPerSample
+        *
+        channels;
 
 
-    if (bytesPerFrame > 0)
-    {
-        wavTotalFrames =
-            dataSize / bytesPerFrame;
-    }
-    else
-    {
-        wavTotalFrames = 0;
-    }
-
-
-    // ========================================================
-    // Untuk 3B-1:
-    //
-    // Playback masih menggunakan pcmData.
-    //
-    // Kita belum menggunakan file streaming di callback.
-    // ========================================================
-
-    pcmData.resize(
-        dataSize / sizeof(int16_t)
-    );
-
-
-    // --------------------------------------------------------
-    // Kembali ke awal PCM
-    // --------------------------------------------------------
-
-    fseek(
-        file,
-        dataOffset,
-        SEEK_SET
-    );
-
-
-    // --------------------------------------------------------
-    // Baca PCM
-    // --------------------------------------------------------
-
-    size_t samplesRead =
-        fread(
-            pcmData.data(),
-            sizeof(int16_t),
-            pcmData.size(),
-            file
-        );
-
-
-    // --------------------------------------------------------
-    // Tutup file
-    // --------------------------------------------------------
-
-    fclose(file);
-
-
-    // --------------------------------------------------------
-    // Validasi hasil baca
-    // --------------------------------------------------------
-
-    if (samplesRead != pcmData.size())
+    if (
+        bytesPerFrame == 0
+    )
     {
         LOGE(
-            "Jumlah PCM yang terbaca tidak sesuai."
+            "Bytes per frame tidak valid."
         );
 
-        pcmData.clear();
-
-        resetWavState();
+        fclose(file);
 
         return false;
     }
 
 
-    playbackPosition = 0;
+    // ========================================================
+    // Simpan metadata
+    // ========================================================
+
+    wavFilePath =
+        path;
+
+
+    wavSampleRate =
+        static_cast<int32_t>(
+            sampleRate
+        );
+
+
+    wavChannels =
+        static_cast<int32_t>(
+            channels
+        );
+
+
+    wavBitsPerSample =
+        static_cast<int32_t>(
+            bitsPerSample
+        );
+
+
+    wavAudioFormat =
+        static_cast<int32_t>(
+            audioFormat
+        );
+
+
+    wavDataOffset =
+        dataOffset;
+
+
+    wavDataSize =
+        dataSize;
+
+
+    wavTotalFrames =
+        dataSize
+        /
+        bytesPerFrame;
+
+
+    fclose(file);
 
 
     // ========================================================
     // Log metadata
     // ========================================================
 
-    LOGI("================================");
+    LOGI(
+        "================================"
+    );
 
-    LOGI("WAV METADATA TERSIMPAN");
+    LOGI(
+        "WAV METADATA TERSIMPAN"
+    );
 
-    LOGI("Path        : %s", wavFilePath.c_str());
+    LOGI(
+        "Path        : %s",
+        wavFilePath.c_str()
+    );
 
-    LOGI("Sample Rate : %d Hz", wavSampleRate);
+    LOGI(
+        "Sample Rate : %d Hz",
+        wavSampleRate
+    );
 
-    LOGI("Channels    : %d", wavChannels);
+    LOGI(
+        "Channels    : %d",
+        wavChannels
+    );
 
-    LOGI("Bit Depth   : %d bit", wavBitsPerSample);
+    LOGI(
+        "Bit Depth   : %d bit",
+        wavBitsPerSample
+    );
 
-    LOGI("Format      : %d", wavAudioFormat);
+    LOGI(
+        "Format      : %d",
+        wavAudioFormat
+    );
 
-    LOGI("Data Offset : %ld", wavDataOffset);
+    LOGI(
+        "Data Offset : %ld",
+        wavDataOffset
+    );
 
-    LOGI("Data Size   : %u bytes", wavDataSize);
+    LOGI(
+        "Data Size   : %u bytes",
+        wavDataSize
+    );
 
-    LOGI("Total Frame : %llu",
-         static_cast<unsigned long long>(
-             wavTotalFrames
-         ));
+    LOGI(
+        "Total Frame : %llu",
+        static_cast<unsigned long long>(
+            wavTotalFrames
+        )
+    );
 
-    LOGI("PCM Samples : %zu", pcmData.size());
+    LOGI(
+        "Ring Buffer : %zu samples",
+        RING_BUFFER_CAPACITY
+    );
 
-    LOGI("================================");
+    LOGI(
+        "Ring Buffer : %zu bytes",
+        RING_BUFFER_CAPACITY
+        *
+        sizeof(int16_t)
+    );
+
+    LOGI(
+        "================================"
+    );
 
 
     return true;
@@ -585,6 +1426,19 @@ bool loadWav(const char* path)
 
 // ============================================================
 // AAudio Callback
+// ============================================================
+//
+// PENTING:
+//
+// Callback ini harus ringan.
+//
+// Tidak ada:
+// - fread()
+// - mutex
+// - condition_variable
+// - sleep
+// - memory allocation
+//
 // ============================================================
 
 aaudio_data_callback_result_t audioCallback(
@@ -595,82 +1449,93 @@ aaudio_data_callback_result_t audioCallback(
 )
 {
     auto* output =
-        static_cast<int16_t*>(audioData);
+        static_cast<int16_t*>(
+            audioData
+        );
 
 
-    int32_t channels =
+    int32_t outputChannels =
         AAudioStream_getChannelCount(
             stream
         );
 
 
-    size_t totalSamples =
-        pcmData.size();
+    size_t requestedSamples =
+        static_cast<size_t>(
+            numFrames
+        )
+        *
+        static_cast<size_t>(
+            outputChannels
+        );
 
 
     // --------------------------------------------------------
-    // Isi buffer output
+    // Baca dari ring buffer
     // --------------------------------------------------------
 
-    for (
-        int32_t frame = 0;
-        frame < numFrames;
-        frame++
+    size_t samplesRead =
+        readFromRingBuffer(
+            output,
+            requestedSamples
+        );
+
+
+    // --------------------------------------------------------
+    // Underrun
+    // --------------------------------------------------------
+
+    if (
+        samplesRead
+        <
+        requestedSamples
     )
     {
-        for (
-            int32_t channel = 0;
-            channel < channels;
-            channel++
+        std::memset(
+            output + samplesRead,
+            0,
+            (
+                requestedSamples
+                -
+                samplesRead
+            )
+            *
+            sizeof(int16_t)
+        );
+
+
+        bool finished =
+            endOfFileReached.load(
+                std::memory_order_acquire
+            );
+
+
+        bool readerStillRunning =
+            readerRunning.load(
+                std::memory_order_acquire
+            );
+
+
+        size_t remainingSamples =
+            getAvailableSamples();
+
+
+        // ----------------------------------------------------
+        // Kalau file sudah habis dan ring buffer kosong
+        // ----------------------------------------------------
+
+        if (
+            finished
+            &&
+            !readerStillRunning
+            &&
+            remainingSamples == 0
         )
         {
-            size_t index =
-                playbackPosition +
-                channel;
-
-
-            if (index < totalSamples)
-            {
-                output[
-                    frame * channels + channel
-                ] = pcmData[index];
-            }
-            else
-            {
-                output[
-                    frame * channels + channel
-                ] = 0;
-            }
-        }
-
-
-        playbackPosition += channels;
-
-
-        // ----------------------------------------------------
-        // Lagu selesai
-        // ----------------------------------------------------
-
-        if (playbackPosition >= totalSamples)
-        {
-            for (
-                int32_t remainingFrame = frame + 1;
-                remainingFrame < numFrames;
-                remainingFrame++
-            )
-            {
-                for (
-                    int32_t channel = 0;
-                    channel < channels;
-                    channel++
-                )
-                {
-                    output[
-                        remainingFrame * channels +
-                        channel
-                    ] = 0;
-                }
-            }
+            playbackFinished.store(
+                true,
+                std::memory_order_release
+            );
 
 
             return AAUDIO_CALLBACK_RESULT_STOP;
@@ -683,7 +1548,7 @@ aaudio_data_callback_result_t audioCallback(
 
 
 // ============================================================
-// Error Callback
+// AAudio Error Callback
 // ============================================================
 
 void errorCallback(
@@ -694,13 +1559,15 @@ void errorCallback(
 {
     LOGE(
         "AAudio error: %s",
-        AAudio_convertResultToText(error)
+        AAudio_convertResultToText(
+            error
+        )
     );
 }
 
 
 // ============================================================
-// Play WAV
+// JNI - Play WAV
 // ============================================================
 
 extern "C"
@@ -712,7 +1579,35 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 )
 {
     // --------------------------------------------------------
-    // Ambil path dari Kotlin
+    // Pastikan playback lama berhenti
+    // --------------------------------------------------------
+
+    if (
+        audioStream != nullptr
+    )
+    {
+        AAudioStream_requestStop(
+            audioStream
+        );
+
+
+        AAudioStream_close(
+            audioStream
+        );
+
+
+        audioStream = nullptr;
+    }
+
+
+    stopReaderThread();
+
+
+    resetRingBuffer();
+
+
+    // --------------------------------------------------------
+    // Ambil path
     // --------------------------------------------------------
 
     const char* filePath =
@@ -723,11 +1618,13 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 
 
     // --------------------------------------------------------
-    // Load WAV
+    // Parse WAV
     // --------------------------------------------------------
 
     bool loaded =
-        loadWav(filePath);
+        loadWav(
+            filePath
+        );
 
 
     env->ReleaseStringUTFChars(
@@ -745,28 +1642,33 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 
 
     // --------------------------------------------------------
-    // Tutup stream sebelumnya
+    // State
     // --------------------------------------------------------
 
-    if (audioStream != nullptr)
-    {
-        AAudioStream_requestStop(
-            audioStream
-        );
+    readerStopRequested.store(
+        false,
+        std::memory_order_release
+    );
 
 
-        AAudioStream_close(
-            audioStream
-        );
+    endOfFileReached.store(
+        false,
+        std::memory_order_release
+    );
 
 
-        audioStream = nullptr;
-    }
+    playbackFinished.store(
+        false,
+        std::memory_order_release
+    );
 
 
-    // --------------------------------------------------------
-    // Builder
-    // --------------------------------------------------------
+    resetRingBuffer();
+
+
+    // ========================================================
+    // AAudio Builder
+    // ========================================================
 
     AAudioStreamBuilder* builder =
         nullptr;
@@ -778,11 +1680,15 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
         );
 
 
-    if (result != AAUDIO_OK)
+    if (
+        result != AAUDIO_OK
+    )
     {
         LOGE(
             "Gagal membuat AAudio builder: %s",
-            AAudio_convertResultToText(result)
+            AAudio_convertResultToText(
+                result
+            )
         );
 
 
@@ -793,7 +1699,7 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 
 
     // --------------------------------------------------------
-    // Konfigurasi AAudio
+    // Konfigurasi output
     // --------------------------------------------------------
 
     AAudioStreamBuilder_setDirection(
@@ -846,9 +1752,9 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
     );
 
 
-    // --------------------------------------------------------
-    // Open
-    // --------------------------------------------------------
+    // ========================================================
+    // Open stream
+    // ========================================================
 
     result =
         AAudioStreamBuilder_openStream(
@@ -862,11 +1768,15 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
     );
 
 
-    if (result != AAUDIO_OK)
+    if (
+        result != AAUDIO_OK
+    )
     {
         LOGE(
             "Gagal membuka AAudio: %s",
-            AAudio_convertResultToText(result)
+            AAudio_convertResultToText(
+                result
+            )
         );
 
 
@@ -879,9 +1789,9 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
     }
 
 
-    // --------------------------------------------------------
-    // Informasi aktual
-    // --------------------------------------------------------
+    // ========================================================
+    // Actual Audio Configuration
+    // ========================================================
 
     int32_t actualSampleRate =
         AAudioStream_getSampleRate(
@@ -908,8 +1818,47 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 
 
     // --------------------------------------------------------
-    // Start
+    // Cek channel
     // --------------------------------------------------------
+
+    if (
+        actualChannels != wavChannels
+    )
+    {
+        LOGE(
+            "Channel mismatch! WAV=%d Actual=%d",
+            wavChannels,
+            actualChannels
+        );
+
+
+        AAudioStream_close(
+            audioStream
+        );
+
+
+        audioStream = nullptr;
+
+
+        return env->NewStringUTF(
+            "Jumlah channel tidak cocok"
+        );
+    }
+
+
+    // ========================================================
+    // Start Reader Thread
+    // ========================================================
+
+    readerThread =
+        std::thread(
+            readerThreadFunction
+        );
+
+
+    // ========================================================
+    // Start AAudio
+    // ========================================================
 
     result =
         AAudioStream_requestStart(
@@ -917,12 +1866,30 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
         );
 
 
-    if (result != AAUDIO_OK)
+    if (
+        result != AAUDIO_OK
+    )
     {
         LOGE(
             "Gagal start AAudio: %s",
-            AAudio_convertResultToText(result)
+            AAudio_convertResultToText(
+                result
+            )
         );
+
+
+        readerStopRequested.store(
+            true,
+            std::memory_order_release
+        );
+
+
+        if (
+            readerThread.joinable()
+        )
+        {
+            readerThread.join();
+        }
 
 
         AAudioStream_close(
@@ -939,8 +1906,36 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
     }
 
 
+    // ========================================================
+    // Success
+    // ========================================================
+
     LOGI(
-        "WAV mulai diputar."
+        "================================"
+    );
+
+    LOGI(
+        "SPSC RING BUFFER AKTIF"
+    );
+
+    LOGI(
+        "Reader Thread : ON"
+    );
+
+    LOGI(
+        "AAudio Callback: ON"
+    );
+
+    LOGI(
+        "Lock-Free Path: ON"
+    );
+
+    LOGI(
+        "WAV Playback  : ON"
+    );
+
+    LOGI(
+        "================================"
     );
 
 
@@ -951,7 +1946,7 @@ Java_com_example_hires_1player_MainActivity_nativePlayWav(
 
 
 // ============================================================
-// Stop
+// JNI - Stop
 // ============================================================
 
 extern "C"
@@ -961,7 +1956,13 @@ Java_com_example_hires_1player_MainActivity_nativeStopAudio(
     jobject /* this */
 )
 {
-    if (audioStream != nullptr)
+    // --------------------------------------------------------
+    // Hentikan AAudio terlebih dahulu
+    // --------------------------------------------------------
+
+    if (
+        audioStream != nullptr
+    )
     {
         AAudioStream_requestStop(
             audioStream
@@ -977,10 +1978,39 @@ Java_com_example_hires_1player_MainActivity_nativeStopAudio(
     }
 
 
-    pcmData.clear();
+    // --------------------------------------------------------
+    // Hentikan reader
+    // --------------------------------------------------------
+
+    stopReaderThread();
+
+
+    // --------------------------------------------------------
+    // Reset
+    // --------------------------------------------------------
+
+    resetRingBuffer();
 
 
     resetWavState();
+
+
+    readerStopRequested.store(
+        false,
+        std::memory_order_release
+    );
+
+
+    endOfFileReached.store(
+        false,
+        std::memory_order_release
+    );
+
+
+    playbackFinished.store(
+        false,
+        std::memory_order_release
+    );
 
 
     LOGI(
@@ -995,7 +2025,7 @@ Java_com_example_hires_1player_MainActivity_nativeStopAudio(
 
 
 // ============================================================
-// Engine Status
+// JNI - Engine Status
 // ============================================================
 
 extern "C"
