@@ -5,10 +5,16 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
-                "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/include"
+                "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/include",
+                "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/include/c++"
             ],
-            "defines": [],
-            "compilerPath": "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe",
+            "defines": [
+                "__ANDROID__"
+            ],
+            "compilerPath": "C:/Users/mazar/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe",
+            "compilerArgs": [
+                "--target=aarch64-none-linux-android26"
+            ],
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "windows-clang-x64"
