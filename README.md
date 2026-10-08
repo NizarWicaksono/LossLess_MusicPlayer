@@ -1,7 +1,6 @@
 # hires_player
 
-A new Flutter project.
-
+Projek Gabut Aja
 ## Getting Started
 
 This project is a starting point for a Flutter application.
